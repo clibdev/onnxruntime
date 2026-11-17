@@ -462,7 +462,7 @@ gsl::span<const SourceReplacement> MoESources() {
         "or exceptional-value parity claim. Source equivalence is checked with TF32 disabled; "
         "fused/direct consistency is checked with TF32 both disabled and enabled. Fixture-local tolerances: "
         "onnxruntime/test/providers/cuda/cuda_runtime_fusion_test.cc, "
-        "CudaRuntimeFusionTest.MoESourceFusedDirectTF32OffAndOn; docs/Cuda_Runtime_Fusion.md.",
+        "MoE/CudaMoERuntimeFusionTest.SourceFusedDirectTF32OffAndOn/*; docs/Cuda_Runtime_Fusion.md.",
         NumericalGuarantee::MathematicalSemanticsWithTolerance};
     SourceBody body{std::move(rule), std::move(numerical), InitializerTransformation::None, {}};
     return SourceReplacement{{kMSDomain, "MoE", 1}, cuda_runtime_fusion::kMoERule, cuda_runtime_fusion::kMoEConfig, std::move(body), DiscoverMoE};

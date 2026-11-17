@@ -299,8 +299,8 @@ ONNX graph with fusion enabled under identical inputs and TF32 disabled,
 and independently checks fused output against the directly authored MoE target
 with TF32 both disabled and enabled,
 including ties, signed gates, cancellation, decode/prefill and E2/8/16/64.
-Its 96 individually filterable/shardable cases retain all three k choices,
-including the duplicate k=2 choices for E=2, with a k-choice index in each name.
+Its 88 individually filterable/shardable cases cover each unique
+(TF32, experts, k, tokens, scaled) combination; E=2 has only k=1 and k=2.
 They disable ConstantFolding and TransposeOptimizer to retain this precise source topology through
 GetCapability; prior optimizations that erase it are not matched.
 Applications that need to preserve the immutable-bank Gather/Squeeze/Transpose
@@ -346,5 +346,5 @@ coverage requires real older hardware, not an architecture override.
 
 ```sh
 ./onnxruntime_test_all --gtest_filter='MoE*:*SwishHostTest.*:CUDARuntimeFusionHostTest.*:ContribSourceReplacementPolicyTest.*:PatternRewriterTests.*:PatternComponentTests.*:PatternCapabilityTests.*'
-./onnxruntime_provider_test --gtest_filter='CudaRuntimeFusionTest.MoE*'
+./onnxruntime_provider_test --gtest_filter='MoE/CudaMoERuntimeFusionTest.*:CudaRuntimeFusionTest.MoE*'
 ```
