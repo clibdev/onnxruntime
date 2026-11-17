@@ -20,7 +20,7 @@ stages:
       sdl:
         binskim:
           enabled: false
-          justificationForDisabling: 'Artifact contains only internal test binaries and third-party Dawn/DXC DLLs for shader-key validation; nothing is shipped.'
+          justificationForDisabling: 'Artifact contains only internal test binaries and third-party Dawn/DXC DLLs for shader key validation; nothing is shipped.'
       outputs:
       - output: pipelineArtifact
         targetPath: '$(Build.ArtifactStagingDirectory)\webgpu-build'
