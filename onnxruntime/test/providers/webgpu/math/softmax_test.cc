@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -90,19 +91,58 @@ TEST(LogSoftmaxOperator, WebGpuAxis) {
   }
 }
 
+TEST(LogSoftmaxOperator, WebGpuLargeBatch) {
+  auto ep = DefaultWebGpuExecutionProvider();
+  if (!ep) GTEST_SKIP() << "WebGPU is unavailable";
+  constexpr int64_t rows = 87381;
+  std::vector<float> input(static_cast<size_t>(rows * 3), -9.0f);
+  for (int64_t row = 0; row < rows; ++row) input[static_cast<size_t>(row * 3 + 2)] = 9.0f;
+  OpTester test("LogSoftmax", 13);
+  test.AddInput<float>("X", {rows, 3}, input);
+  test.AddOutput<float>("Y", {rows, 3}, std::vector<float>(input.size()));
+  test.SetCustomOutputVerifier([](const std::vector<OrtValue>& fetches, const std::string&) {
+    const auto output = fetches[0].Get<Tensor>().DataAsSpan<float>();
+    const double normalizer = std::log1p(2.0 * std::exp(-18.0));
+    for (size_t j = 0; j < output.size(); ++j) {
+      const double expected = (j % 3 == 2 ? 0.0 : -18.0) - normalizer;
+      EXPECT_NEAR(output[j], expected, std::abs(expected) * 2e-3) << "index=" << j;
+    }
+  });
+  SessionOptions options;
+  ASSERT_STATUS_OK(options.config_options.AddConfigEntry("session.disable_cpu_ep_fallback", "1"));
+  std::vector<std::unique_ptr<IExecutionProvider>> eps;
+  eps.push_back(std::move(ep));
+  test.Run(options, OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &eps);
+}
+
 TEST(LogSoftmaxOperator, WebGpuNonfinite) {
   const float inf = std::numeric_limits<float>::infinity();
   for (int64_t classes : {3, 257}) {
-    for (float exceptional : {inf, -inf, std::numeric_limits<float>::quiet_NaN()}) {
+    for (int pattern : {0, 1, 2, 3, 4, 5}) {
       auto ep = DefaultWebGpuExecutionProvider();
       if (!ep) GTEST_SKIP() << "WebGPU is unavailable";
       std::vector<float> input(static_cast<size_t>(classes), -inf);
-      input[static_cast<size_t>(classes / 2)] = exceptional;
+      if (pattern < 3) {
+        input[static_cast<size_t>(classes / 2)] =
+            pattern == 0 ? inf : (pattern == 1 ? -inf : std::numeric_limits<float>::quiet_NaN());
+      } else if (pattern == 3) {
+        input[static_cast<size_t>(classes / 2)] = 0.0f;
+      } else {
+        std::fill(input.begin(), input.end(), 1.0f);
+        input[static_cast<size_t>(pattern - 4)] = std::numeric_limits<float>::quiet_NaN();
+      }
       OpTester test("LogSoftmax", 13);
       test.AddInput<float>("X", {1, classes}, input);
       test.AddOutput<float>("Y", {1, classes}, std::vector<float>(input.size()));
-      test.SetCustomOutputVerifier([](const std::vector<OrtValue>& fetches, const std::string&) {
-        for (float value : fetches[0].Get<Tensor>().DataAsSpan<float>()) EXPECT_TRUE(std::isnan(value));
+      test.SetCustomOutputVerifier([=](const std::vector<OrtValue>& fetches, const std::string&) {
+        const auto output = fetches[0].Get<Tensor>().DataAsSpan<float>();
+        for (size_t j = 0; j < output.size(); ++j) {
+          if (pattern == 3) {
+            EXPECT_EQ(output[j], j == static_cast<size_t>(classes / 2) ? 0.0f : -inf);
+          } else {
+            EXPECT_TRUE(std::isnan(output[j])) << "pattern=" << pattern << " index=" << j;
+          }
+        }
       });
       SessionOptions options;
       ASSERT_STATUS_OK(options.config_options.AddConfigEntry("session.disable_cpu_ep_fallback", "1"));

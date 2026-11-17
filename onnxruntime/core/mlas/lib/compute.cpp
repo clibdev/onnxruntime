@@ -413,37 +413,42 @@ Return Value:
     if (N >= 4) {
         MLAS_FLOAT32X4 AccumulatorVector = MlasZeroFloat32x4();
 
-#if !defined(MLAS_SSE2_INTRINSICS)
+        MLAS_FLOAT32X4 AccumulatorVector1 = MlasZeroFloat32x4();
+        MLAS_FLOAT32X4 AccumulatorVector2 = MlasZeroFloat32x4();
+        MLAS_FLOAT32X4 AccumulatorVector3 = MlasZeroFloat32x4();
 
-        //
-        // Unroll the loop for architectures that can benefit from improved
-        // instruction level parallelism.
-        //
-        // N.B. The extra code size is not worth the benefit for SSE2 as the
-        // MLAS_TARGET_AMD64 build already has specialized AVX2/AVX512F kernels
-        // that do this.
-        //
-
-        while (N >= 8) {
+        // Independent sums shorten both the rounding-error chain and the add dependency.
+        while (N >= 16) {
             MLAS_FLOAT32X4 Vector0 = MlasLoadFloat32x4(Input);
             MLAS_FLOAT32X4 Vector1 = MlasLoadFloat32x4(Input + 4);
+            MLAS_FLOAT32X4 Vector2 = MlasLoadFloat32x4(Input + 8);
+            MLAS_FLOAT32X4 Vector3 = MlasLoadFloat32x4(Input + 12);
 
             Vector0 = MlasComputeSumExpVector(Vector0, NegativeMaximumVector);
             Vector1 = MlasComputeSumExpVector(Vector1, NegativeMaximumVector);
+            Vector2 = MlasComputeSumExpVector(Vector2, NegativeMaximumVector);
+            Vector3 = MlasComputeSumExpVector(Vector3, NegativeMaximumVector);
             AccumulatorVector = MlasAddFloat32x4(AccumulatorVector, Vector0);
-            AccumulatorVector = MlasAddFloat32x4(AccumulatorVector, Vector1);
+            AccumulatorVector1 = MlasAddFloat32x4(AccumulatorVector1, Vector1);
+            AccumulatorVector2 = MlasAddFloat32x4(AccumulatorVector2, Vector2);
+            AccumulatorVector3 = MlasAddFloat32x4(AccumulatorVector3, Vector3);
 
             if (Output != nullptr) {
                 MlasStoreFloat32x4(Output, Vector0);
                 MlasStoreFloat32x4(Output + 4, Vector1);
-                Output += 8;
+                MlasStoreFloat32x4(Output + 8, Vector2);
+                MlasStoreFloat32x4(Output + 12, Vector3);
+                Output += 16;
             }
 
-            Input += 8;
-            N -= 8;
+            Input += 16;
+            N -= 16;
         }
 
-#endif
+        AccumulatorVector = MlasAddFloat32x4(
+            MlasAddFloat32x4(AccumulatorVector, AccumulatorVector1),
+            MlasAddFloat32x4(AccumulatorVector2, AccumulatorVector3)
+        );
 
         while (N >= 4) {
             MLAS_FLOAT32X4 Vector = MlasLoadFloat32x4(Input);
@@ -805,7 +810,7 @@ MlasComputeSoftmaxTail(
 {
     // Float callers use this for tiny tails. Scale before exponentiation to avoid rounding each term to a subnormal.
     constexpr float ExponentOffset = std::is_same_v<T, float> ? 64.0f : 0.0f;
-    float Tail = 0.0f;
+    double Tail = 0.0;
     for (size_t Offset = 0; Offset < D; Offset += 256) {
         float Buffer[256];
         const size_t Count = std::min(size_t(256), D - Offset);
@@ -833,7 +838,7 @@ MlasComputeSoftmaxTail(
             Tail += Buffer[j];
         }
     }
-    return Tail * std::exp(-ExponentOffset);
+    return static_cast<float>(Tail * std::exp(-ExponentOffset));
 }
 
 #if defined(MLAS_TARGET_AMD64)
@@ -988,7 +993,8 @@ Return Value:
         //
         float* Temp = LogSoftmax ? nullptr : Output;
         float Accumulation;
-        bool SeparateMaximum = LogSoftmax && !SmoothSoftmax && std::isfinite(Maximum);
+        const bool LongRow = D >= 1024;
+        bool SeparateMaximum = (LogSoftmax || LongRow) && !SmoothSoftmax && std::isfinite(Maximum);
         size_t Pivot = 0;
         if (SeparateMaximum) {
 #if defined(MLAS_SSE2_INTRINSICS)
@@ -1022,6 +1028,23 @@ Return Value:
 #else
         auto* SumExpKernel = MlasComputeSumExpF32Kernel;
 #endif
+        const auto SumExp = [&](const float* Values, float* Exponentials, size_t Count) {
+            if (!LongRow) {
+                return SumExpKernel(Values, Exponentials, Count, &NegativeMaximum);
+            }
+            // Bound SIMD lane accumulation error, then combine the partial sums in double precision.
+            double Sum = 0.0;
+            while (Count > 0) {
+                const size_t Chunk = std::min(Count, size_t(1024));
+                Sum += SumExpKernel(Values, Exponentials, Chunk, &NegativeMaximum);
+                Values += Chunk;
+                if (Exponentials != nullptr) {
+                    Exponentials += Chunk;
+                }
+                Count -= Chunk;
+            }
+            return static_cast<float>(Sum);
+        };
         if (SeparateMaximum) {
             // Exclude one maximum before reduction, rather than subtracting a rounded one afterwards.
             if (D <= 4 && Pivot > 0 && Pivot + 1 < D) {
@@ -1032,19 +1055,23 @@ Return Value:
                         TailInput[Count++] = Input[j];
                     }
                 }
-                Accumulation = SumExpKernel(TailInput, nullptr, Count, &NegativeMaximum);
+                Accumulation = SumExp(TailInput, nullptr, Count);
             } else {
-                Accumulation = Pivot == 0 ? 0.0f : SumExpKernel(Input, nullptr, Pivot, &NegativeMaximum);
+                Accumulation = Pivot == 0 ? 0.0f : SumExp(Input, Temp, Pivot);
                 if (Pivot + 1 < D) {
-                    Accumulation += SumExpKernel(Input + Pivot + 1, nullptr, D - Pivot - 1, &NegativeMaximum);
+                    Accumulation += SumExp(Input + Pivot + 1, Temp == nullptr ? nullptr : Temp + Pivot + 1, D - Pivot - 1);
                 }
             }
             // Sum-exp clamps below -88.4. Use full-range exp before that floor can affect a float ulp of the tail.
-            if (D > 1 && Accumulation < float(D) * 1.0e-31f) {
+            if (LogSoftmax && D > 1 && Accumulation < float(D) * 1.0e-31f) {
                 Accumulation = MlasComputeSoftmaxTail(Input, D, Pivot, NegativeMaximum);
             }
+            if (!LogSoftmax) {
+                Temp[Pivot] = 1.0f;
+                Accumulation += 1.0f;
+            }
         } else {
-            Accumulation = SumExpKernel(Input, Temp, D, &NegativeMaximum);
+            Accumulation = SumExp(Input, Temp, D);
         }
 
         if (SmoothSoftmax) {

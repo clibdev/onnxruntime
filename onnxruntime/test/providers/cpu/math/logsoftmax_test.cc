@@ -7,12 +7,84 @@
 #include "test/providers/provider_test_utils.h"
 #include "test/util/include/default_providers.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <type_traits>
 
 namespace onnxruntime {
 namespace test {
+
+static void TestLongVocabularyCPU(bool logarithmic) {
+  for (int64_t classes : {1024, 1025, 4096, 4097, 151936, 151937, 1048576}) {
+    for (int64_t pivot : {int64_t(0), classes / 2, classes - 1}) {
+      for (bool tied : {false, true}) {
+        std::vector<float> logits(static_cast<size_t>(classes), -4.0f);
+        logits[static_cast<size_t>(pivot)] = 10.0f;
+        const int64_t other = (pivot + 1) % classes;
+        if (tied) logits[static_cast<size_t>(other)] = 10.0f;
+        const int64_t maximum_count = tied ? 2 : 1;
+        const double tail = (maximum_count - 1) + (classes - maximum_count) * std::exp(-14.0);
+        const double normalizer = std::log1p(tail);
+        const double probability = 1.0 / (1.0 + tail);
+        OpTester test(logarithmic ? "LogSoftmax" : "Softmax", 13);
+        test.AddInput<float>("X", {1, classes}, logits);
+        test.AddOutput<float>("Y", {1, classes}, std::vector<float>(logits.size()));
+        test.SetCustomOutputVerifier([=](const std::vector<OrtValue>& fetches, const std::string&) {
+          const auto output = fetches[0].Get<Tensor>().DataAsSpan<float>();
+          for (int64_t j = 0; j < classes; ++j) {
+            const bool maximum = j == pivot || (tied && j == other);
+            const double expected = logarithmic ? (maximum ? 0.0 : -14.0) - normalizer
+                                                : (maximum ? 1.0 : std::exp(-14.0)) * probability;
+            EXPECT_NEAR(output[static_cast<size_t>(j)], expected, std::abs(expected) * 2e-6)
+                << "classes=" << classes << " pivot=" << pivot << " tied=" << tied << " index=" << j;
+          }
+          if (!logarithmic) {
+            const double gradient = -tail / (1.0 + tail);
+            EXPECT_NEAR(output[static_cast<size_t>(pivot)] - 1.0f, gradient,
+                        std::max(std::abs(gradient) * 3e-6,
+                                 static_cast<double>(std::numeric_limits<float>::epsilon()) * 0.5))
+                << "classes=" << classes << " pivot=" << pivot << " tied=" << tied;
+          }
+        });
+        std::vector<std::unique_ptr<IExecutionProvider>> eps;
+        eps.push_back(DefaultCpuExecutionProvider());
+        test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &eps);
+      }
+    }
+  }
+}
+
+TEST(LogSoftmaxOperator, LongVocabularyCPU) {
+  TestLongVocabularyCPU(true);
+}
+
+TEST(SoftmaxOperator, LongVocabularyCPU) {
+  TestLongVocabularyCPU(false);
+}
+
+TEST(SoftmaxOperator, LongRowInPlaceCPU) {
+  for (size_t classes : {1025, 151936}) {
+    for (bool logarithmic : {false, true}) {
+      // Softmax retains the existing sum-exp exponent floor; LogSoftmax preserves subnormal tails.
+      for (double margin : {14.0, logarithmic ? 100.0 : 80.0}) {
+        std::vector<float> logits(2 * classes, static_cast<float>(-margin));
+        logits[classes / 2] = logits[2 * classes - 1] = 0.0f;
+        MlasComputeSoftmax(logits.data(), logits.data(), 2, classes, logarithmic, false, 0.0f, nullptr);
+        const double tail = (classes - 1) * std::exp(-margin);
+        for (size_t j = 0; j < logits.size(); ++j) {
+          const bool maximum = j == classes / 2 || j == 2 * classes - 1;
+          const double expected = logarithmic ? (maximum ? 0.0 : -margin) - std::log1p(tail)
+                                              : (maximum ? 1.0 : std::exp(-margin)) / (1.0 + tail);
+          EXPECT_NEAR(logits[j], expected,
+                      std::max(std::abs(expected) * 2e-6,
+                               static_cast<double>(std::numeric_limits<float>::denorm_min())))
+              << "classes=" << classes << " logarithmic=" << logarithmic << " index=" << j;
+        }
+      }
+    }
+  }
+}
 
 template <typename T>
 static void TestLogSoftmaxCollapse(bool cuda, double margin, double tolerance) {
@@ -166,15 +238,27 @@ static void TestLogSoftmaxNonfinite(bool cuda) {
   if (cuda && !DefaultCudaExecutionProvider()) GTEST_SKIP() << "CUDA is unavailable";
   const float inf = std::numeric_limits<float>::infinity();
   for (int64_t classes : {3, 1025, 2049}) {
-    for (float exceptional : {inf, -inf, std::numeric_limits<float>::quiet_NaN()}) {
+    for (int pattern : {0, 1, 2, 3, 4, 5}) {
       std::vector<float> logits(static_cast<size_t>(classes), -inf);
-      logits[0] = exceptional;
+      if (pattern < 3) {
+        logits[0] = pattern == 0 ? inf : (pattern == 1 ? -inf : std::numeric_limits<float>::quiet_NaN());
+      } else if (pattern == 3) {
+        logits[static_cast<size_t>(classes / 2)] = 0.0f;
+      } else {
+        std::fill(logits.begin(), logits.end(), 1.0f);
+        logits[static_cast<size_t>(pattern - 4)] = std::numeric_limits<float>::quiet_NaN();
+      }
       OpTester test("LogSoftmax", 13);
       test.AddInput<float>("X", {1, classes}, logits);
       test.AddOutput<float>("Y", {1, classes}, std::vector<float>(logits.size()));
       test.SetCustomOutputVerifier([=](const std::vector<OrtValue>& fetches, const std::string&) {
-        for (float value : fetches[0].Get<Tensor>().DataAsSpan<float>()) {
-          EXPECT_TRUE(std::isnan(value));
+        const auto output = fetches[0].Get<Tensor>().DataAsSpan<float>();
+        for (size_t j = 0; j < output.size(); ++j) {
+          if (pattern == 3) {
+            EXPECT_EQ(output[j], j == static_cast<size_t>(classes / 2) ? 0.0f : -inf);
+          } else {
+            EXPECT_TRUE(std::isnan(output[j])) << "pattern=" << pattern << " index=" << j;
+          }
         }
       });
       std::vector<std::unique_ptr<IExecutionProvider>> eps;

@@ -297,7 +297,7 @@ __global__ void softmax_block_forward(outscalar_t* output, scalar_t* input, int 
   if constexpr (IsLogSoftmax) {
     int pivot = classes;
     for (int i = threadIdx.x; i < classes; i += blockDim.x) {
-      if (std::isfinite(max_k) && static_cast<accscalar_t>(input[i]) == max_k) pivot = min(pivot, i);
+      if (isfinite(max_k) && static_cast<accscalar_t>(input[i]) == max_k) pivot = min(pivot, i);
     }
     pivot = blockReduce<Min, int>(reinterpret_cast<int*>(smem), pivot, Min<int>(), classes);
     for (int i = threadIdx.x; i < classes; i += blockDim.x) {
@@ -322,7 +322,7 @@ __global__ void softmax_block_forward(outscalar_t* output, scalar_t* input, int 
 template <typename T, typename AccumT, typename OutT>
 struct LogSoftMaxForwardEpilogue {
   __device__ __forceinline__ LogSoftMaxForwardEpilogue(AccumT max_input, AccumT sum)
-      : max_input(max_input), logsum(std::isfinite(max_input) ? std::log1p(sum) : std::log(sum)) {}
+      : max_input(max_input), logsum(isfinite(max_input) ? std::log1p(sum) : std::log(sum)) {}
 
   __device__ __forceinline__ OutT operator()(T input) const {
     return static_cast<OutT>((AccumT)input - max_input - logsum);

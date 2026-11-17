@@ -46,14 +46,6 @@ common::Status SoftmaxCPU(size_t N,
     return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, msg);
   }
 
-  std::vector<T> scale(N);
-  std::vector<T> rowmax(N);
-  std::vector<T> sum_multiplier(D, 1.f);  // initialize all multiplier values to 1.0
-
-  const int n = gsl::narrow_cast<int>(N);
-  const int d = gsl::narrow_cast<int>(D);
-  const int nd = gsl::narrow_cast<int>(N * D);
-
   if (logarithmic && D != 0) {
     concurrency::ThreadPool::TryParallelFor(
         thread_pool, N, static_cast<double>(D),
@@ -75,6 +67,14 @@ common::Status SoftmaxCPU(size_t N,
         });
     return Status::OK();
   }
+
+  std::vector<T> scale(N);
+  std::vector<T> rowmax(N);
+  std::vector<T> sum_multiplier(D, 1.f);  // initialize all multiplier values to 1.0
+
+  const int n = gsl::narrow_cast<int>(N);
+  const int d = gsl::narrow_cast<int>(D);
+  const int nd = gsl::narrow_cast<int>(N * D);
 
   math::RowwiseMax<T, CPUMathUtil>(n, d, Xdata, rowmax.data(), nullptr);
 

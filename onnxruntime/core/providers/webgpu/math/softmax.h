@@ -45,7 +45,8 @@ class LogSoftmaxProgram final : public Program<LogSoftmaxProgram> {
 
   Status GenerateShaderCode(ShaderHelper& shader) const override;
 
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"cols", ProgramUniformVariableDataType::Uint32});
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"cols", ProgramUniformVariableDataType::Uint32},
+                                          {"rows", ProgramUniformVariableDataType::Uint32});
 
  private:
   uint32_t workgroup_size_;

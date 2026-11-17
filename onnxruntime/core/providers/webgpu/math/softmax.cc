@@ -73,6 +73,7 @@ Status LogSoftmaxProgram::GenerateShaderCode(ShaderHelper& shader) const {
       << "  return log(1.0 + tail);\n"
       << "}\n";
   shader.MainFunctionBody()
+      << "if (workgroup_idx >= uniforms.rows) { return; }\n"
       << "let lane = local_idx;\n"
       << "let base = workgroup_idx * uniforms.cols;\n"
       << "var maximum = -3.4028234663852886e+38f;\n"
@@ -120,9 +121,12 @@ Status LogSoftmaxProgram::GenerateShaderCode(ShaderHelper& shader) const {
       << "let normalizer = logNormalizer(tails[0]);\n"
       // WGSL rejects non-finite constant expressions, so bitcast a runtime let.
       << "let nan_bits = 0x7fc00000u;\n"
+      // The runtime-zero bit operation prevents fast-math from reassociating the subtractions.
+      << "let opaque_zero = uniforms.cols >> 31u;\n"
       << "for (var col = lane; col < uniforms.cols; col += " << workgroup_size_ << "u) {\n"
-      << "  let value = result_element_t(select((f32(" << input.GetByOffset("base + col")
-      << ") - maximum) - normalizer, bitcast<f32>(nan_bits), "
+      << "  let shifted = bitcast<f32>(bitcast<u32>(f32(" << input.GetByOffset("base + col")
+      << ") - maximum) | opaque_zero);\n"
+      << "  let value = result_element_t(select(shifted - normalizer, bitcast<f32>(nan_bits), "
          "invalid[0] != 0u || pivot == uniforms.cols));\n"
       << output.SetByOffset("base + col", "value") << "\n"
       << "}\n";
@@ -238,6 +242,9 @@ Status Softmax::ComputeInternal(ComputeContext& context) const {
   if (input_shape.Size() == 0) {
     return Status::OK();
   }
+  ORT_RETURN_IF(log_softmax_ && input_shape.Size() > INT32_MAX,
+                "WebGPU LogSoftmax supports at most ", INT32_MAX, " elements, but received ",
+                input_shape.Size(), ". Split the input into smaller batches.");
   // The `axis` attribute of the opset lower than version 13 describes the axis of the inputs when coerced to 2D,
   // the 0th axis most likely describes the batch_size, so transpose is not required on old opset versions.
   bool is_transpose_required = axis < input_rank - 1 && opset_ >= 13;
@@ -282,7 +289,7 @@ Status Softmax::ComputeInternal(ComputeContext& context) const {
                       ProgramTensorMetadataDependency::TypeAndRank}})
         .SetWorkgroupSize(workgroup_size)
         .SetDispatchGroupSize(static_cast<uint32_t>(rows))
-        .AddUniformVariables({{static_cast<uint32_t>(cols)}});
+        .AddUniformVariables({{static_cast<uint32_t>(cols)}, {static_cast<uint32_t>(rows)}});
     ORT_RETURN_IF_ERROR(context.RunProgram(program));
     if (is_transpose_required) {
       ORT_RETURN_IF_ERROR(Transpose::DoTranspose(context, perm, intermediate_output, *output_tensor));

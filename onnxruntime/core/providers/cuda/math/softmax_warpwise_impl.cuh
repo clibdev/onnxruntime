@@ -143,7 +143,7 @@ __global__ void softmax_warp_forward(output_t* dst, const input_t* src, int batc
       pivot[i] = element_count;
       for (int it = 0; it < WARP_ITERATIONS; ++it) {
         const int index = local_idx + it * WARP_SIZE;
-        if (index < element_count && std::isfinite(max_value[i]) && elements[i][it] == max_value[i]) {
+        if (index < element_count && isfinite(max_value[i]) && elements[i][it] == max_value[i]) {
           pivot[i] = min(pivot[i], index);
         }
       }
@@ -156,7 +156,7 @@ __global__ void softmax_warp_forward(output_t* dst, const input_t* src, int batc
   for (int i = 0; i < WARP_BATCH; ++i) {
 #pragma unroll
     for (int it = 0; it < WARP_ITERATIONS; ++it) {
-      if (is_log_softmax) {
+      if constexpr (is_log_softmax) {
         if (local_idx + it * WARP_SIZE != pivot[i]) {
           sum[i] += std::exp(elements[i][it] - max_value[i]);
         }
@@ -173,12 +173,12 @@ __global__ void softmax_warp_forward(output_t* dst, const input_t* src, int batc
   for (int i = 0; i < WARP_BATCH; ++i) {
     if (i >= local_batches)
       break;
-    if (is_log_softmax) sum[i] = std::isfinite(max_value[i]) ? std::log1p(sum[i]) : std::log(sum[i]);
+    if constexpr (is_log_softmax) sum[i] = isfinite(max_value[i]) ? std::log1p(sum[i]) : std::log(sum[i]);
 #pragma unroll
     for (int it = 0; it < WARP_ITERATIONS; ++it) {
       int element_index = local_idx + it * WARP_SIZE;
       if (element_index < element_count) {
-        if (is_log_softmax) {
+        if constexpr (is_log_softmax) {
           dst[i * element_count + it * WARP_SIZE] = (elements[i][it] - max_value[i]) - sum[i];
         } else {
           dst[i * element_count + it * WARP_SIZE] = elements[i][it] / sum[i];
@@ -233,7 +233,7 @@ __global__ void softmax_warp_forward_resource_efficient(output_t* dst, const inp
   warp_reduce<input_t, 1, WARP_SIZE, Max>(&max_value);
   bool exclude_max = false;
   if constexpr (is_log_softmax) {
-    int pivot_lane = std::isfinite(static_cast<acc_t>(max_value)) && thread_max == max_value
+    int pivot_lane = isfinite(static_cast<acc_t>(max_value)) && thread_max == max_value
                          ? local_idx
                          : WARP_SIZE;
     warp_reduce<int, 1, WARP_SIZE, Min>(&pivot_lane);
@@ -247,7 +247,7 @@ __global__ void softmax_warp_forward_resource_efficient(output_t* dst, const inp
     int element_index = local_idx + it * WARP_SIZE;
     if (element_index >= element_count)
       break;
-    if (is_log_softmax) {
+    if constexpr (is_log_softmax) {
       // Tied maxima have identical exponentials; one lane skips its first maximum.
       if (exclude_max && elements[it][local_idx] == max_value) {
         exclude_max = false;
@@ -262,17 +262,20 @@ __global__ void softmax_warp_forward_resource_efficient(output_t* dst, const inp
   }
   warp_reduce<acc_t, 1, WARP_SIZE, Add>(&sum);
   // store result
-  if (is_log_softmax) sum = std::isfinite(static_cast<acc_t>(max_value)) ? std::log1p(sum) : std::log(sum);
-  // do the reciprocal once, so the div operation can be replaced by mul.
-  acc_t invsum = static_cast<acc_t>(1.0f / sum);
+  if constexpr (is_log_softmax) {
+    sum = isfinite(static_cast<acc_t>(max_value)) ? std::log1p(sum) : std::log(sum);
+  } else {
+    // Do the reciprocal once, so the div operation can be replaced by mul.
+    sum = static_cast<acc_t>(1.0f / sum);
+  }
 #pragma unroll
   for (int it = 0; it < WARP_ITERATIONS; ++it) {
     int element_index = local_idx + it * WARP_SIZE;
     if (element_index < element_count) {
-      if (is_log_softmax) {
+      if constexpr (is_log_softmax) {
         dst[it * WARP_SIZE] = (static_cast<acc_t>(elements[it][local_idx]) - static_cast<acc_t>(max_value)) - sum;
       } else {
-        dst[it * WARP_SIZE] = (float)elements[it][local_idx] * invsum;
+        dst[it * WARP_SIZE] = (float)elements[it][local_idx] * sum;
       }
     } else {
       break;
