@@ -1539,6 +1539,8 @@ Status LaunchLinearAttentionStateFromGdn(cudaStream_t stream, const float* gdn_s
   return LaunchTransposeLinearAttentionState<float, T>(stream, gdn_state, state, rows, d_v, d_k);
 }
 
+template Status LaunchLinearAttentionStateToGdn<float>(cudaStream_t, const float*, float*, int, int, int);
+template Status LaunchLinearAttentionStateFromGdn<float>(cudaStream_t, const float*, float*, int, int, int);
 template Status LaunchLinearAttentionStateToGdn<half>(cudaStream_t, const half*, float*, int, int, int);
 template Status LaunchLinearAttentionStateFromGdn<half>(cudaStream_t, const float*, half*, int, int, int);
 #if __CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__)

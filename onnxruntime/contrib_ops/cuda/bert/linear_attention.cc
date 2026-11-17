@@ -7,6 +7,7 @@
 #include "contrib_ops/cpu/bert/linear_attention_helper.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/cuda_type_conversion.h"
+#include "core/providers/cuda/math/unary_elementwise_ops_impl.h"
 #include "core/platform/env_var_utils.h"
 
 #include <limits>
@@ -198,47 +199,73 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
   // The GatedDeltaNet op implements the same recurrence with a tensor-core chunked engine for long
   // inputs. Its token-major q/k/v/gates/output match this op's [B, T, H*D] packing for uniform batches;
   // only the state differs (float, [B, H_v, d_v, d_k]), so it is staged through a scratch buffer.
-  if constexpr (!std::is_same_v<T, float>) {
-    if (chunked_prefill_ && update_rule_ == "gated_delta" && state_window_ == 0 && !decay_per_key_dim &&
-        beta_per_head && q_num_heads_ == n_k_heads && kv_num_heads_ % q_num_heads_ == 0) {
-      namespace gdn = gated_delta_net;
-      gdn::Descriptor desc{};
-      desc.total_tokens = static_cast<int64_t>(batch_size) * seq_len;
-      desc.batch = batch_size;
-      desc.num_heads_q = q_num_heads_;
-      desc.num_heads_k = n_k_heads;
-      desc.num_heads_v = kv_num_heads_;
-      desc.head_size_qk = d_k;
-      desc.head_size_v = d_v;
-      desc.chunk_size = chunk_size_;
-      desc.update_rule = gdn::UpdateRule::kGatedDelta;
-      desc.io_type = std::is_same_v<T, MLFloat16> ? gdn::IoType::kFloat16 : gdn::IoType::kBFloat16;
-      desc.sm_major = GetDeviceProp().major;
-      const gdn::Plan plan = gdn::SelectPlan(desc, GetDeviceProp().sharedMemPerBlockOptin);
-      if (plan.supported && plan.engine == gdn::Engine::kChunked) {
-        const int rows = batch_size * kv_num_heads_;
-        auto gdn_state = GetScratchBuffer<float>(static_cast<size_t>(rows) * d_k * d_v, GetComputeStream(context));
-        if (past_state_tensor != nullptr) {
-          ORT_RETURN_IF_ERROR(LaunchLinearAttentionStateToGdn<CudaT>(
-              Stream(context), reinterpret_cast<const CudaT*>(past_state_tensor->Data<T>()), gdn_state.get(),
-              rows, d_k, d_v));
-        }
-        gdn::VariantPack<CudaT> pack{};
+  // The engine's GEMM operands are 16-bit, so float q/k/v/output round through float16 scratch; the
+  // gates and the state stay float.
+  if (chunked_prefill_ && update_rule_ == "gated_delta" && state_window_ == 0 && !decay_per_key_dim &&
+      beta_per_head && q_num_heads_ == n_k_heads && kv_num_heads_ % q_num_heads_ == 0) {
+    namespace gdn = gated_delta_net;
+    using GdnT = std::conditional_t<std::is_same_v<T, float>, half, CudaT>;
+    gdn::Descriptor desc{};
+    desc.total_tokens = static_cast<int64_t>(batch_size) * seq_len;
+    desc.batch = batch_size;
+    desc.num_heads_q = q_num_heads_;
+    desc.num_heads_k = n_k_heads;
+    desc.num_heads_v = kv_num_heads_;
+    desc.head_size_qk = d_k;
+    desc.head_size_v = d_v;
+    desc.chunk_size = chunk_size_;
+    desc.update_rule = gdn::UpdateRule::kGatedDelta;
+    desc.io_type = std::is_same_v<T, BFloat16> ? gdn::IoType::kBFloat16 : gdn::IoType::kFloat16;
+    desc.sm_major = GetDeviceProp().major;
+    const gdn::Plan plan = gdn::SelectPlan(desc, GetDeviceProp().sharedMemPerBlockOptin);
+    if (plan.supported && plan.engine == gdn::Engine::kChunked) {
+      cudaStream_t stream = Stream(context);
+      const int rows = batch_size * kv_num_heads_;
+      auto gdn_state = GetScratchBuffer<float>(static_cast<size_t>(rows) * d_k * d_v, GetComputeStream(context));
+      if (past_state_tensor != nullptr) {
+        ORT_RETURN_IF_ERROR(LaunchLinearAttentionStateToGdn<CudaT>(
+            stream, reinterpret_cast<const CudaT*>(past_state_tensor->Data<T>()), gdn_state.get(), rows, d_k, d_v));
+      }
+      gdn::VariantPack<GdnT> pack{};
+      IAllocatorUniquePtr<GdnT> narrowed;
+      if constexpr (std::is_same_v<T, float>) {
+        const size_t query_count = static_cast<size_t>(query_tensor->Shape().Size());
+        const size_t key_count = static_cast<size_t>(key_tensor->Shape().Size());
+        const size_t value_count = static_cast<size_t>(value_tensor->Shape().Size());
+        const size_t output_count = static_cast<size_t>(output_tensor->Shape().Size());
+        narrowed = GetScratchBuffer<GdnT>(query_count + key_count + value_count + output_count,
+                                          GetComputeStream(context));
+        GdnT* query16 = narrowed.get();
+        GdnT* key16 = query16 + query_count;
+        GdnT* value16 = key16 + key_count;
+        Impl_Cast<float, half>(stream, query_tensor->Data<float>(), query16, query_count);
+        Impl_Cast<float, half>(stream, key_tensor->Data<float>(), key16, key_count);
+        Impl_Cast<float, half>(stream, value_tensor->Data<float>(), value16, value_count);
+        pack.query = query16;
+        pack.key = key16;
+        pack.value = value16;
+        pack.output = value16 + value_count;
+        pack.gates_in_input_type = false;
+      } else {
         pack.query = reinterpret_cast<const CudaT*>(query_tensor->Data<T>());
         pack.key = reinterpret_cast<const CudaT*>(key_tensor->Data<T>());
         pack.value = reinterpret_cast<const CudaT*>(value_tensor->Data<T>());
-        pack.decay = decay_tensor->DataRaw();
-        pack.beta = beta_tensor->DataRaw();
-        pack.gates_in_input_type = true;
-        pack.initial_state = past_state_tensor != nullptr ? gdn_state.get() : nullptr;
         pack.output = reinterpret_cast<CudaT*>(output_tensor->MutableData<T>());
-        pack.final_state = gdn_state.get();
-        ORT_RETURN_IF_ERROR(gdn::LaunchGatedDeltaNet<CudaT>(
-            desc, plan, pack, s, GetDeviceProp().maxThreadsPerBlock,
-            static_cast<size_t>(GetDeviceProp().sharedMemPerBlockOptin), Stream(context)));
-        return LaunchLinearAttentionStateFromGdn<CudaT>(
-            Stream(context), gdn_state.get(), reinterpret_cast<CudaT*>(present_state_data), rows, d_k, d_v);
+        pack.gates_in_input_type = true;
       }
+      pack.decay = decay_tensor->DataRaw();
+      pack.beta = beta_tensor->DataRaw();
+      pack.initial_state = past_state_tensor != nullptr ? gdn_state.get() : nullptr;
+      pack.final_state = gdn_state.get();
+      ORT_RETURN_IF_ERROR(gdn::LaunchGatedDeltaNet<GdnT>(
+          desc, plan, pack, s, GetDeviceProp().maxThreadsPerBlock,
+          static_cast<size_t>(GetDeviceProp().sharedMemPerBlockOptin), stream));
+      if constexpr (std::is_same_v<T, float>) {
+        Impl_Cast<half, float>(stream, pack.output, output_tensor->MutableData<float>(),
+                               static_cast<size_t>(output_tensor->Shape().Size()));
+      }
+      return LaunchLinearAttentionStateFromGdn<CudaT>(
+          stream, gdn_state.get(), reinterpret_cast<CudaT*>(present_state_data), rows, d_k, d_v);
     }
   }
 

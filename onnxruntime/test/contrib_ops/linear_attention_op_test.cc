@@ -13,6 +13,7 @@
 #include "test/common/tensor_op_test_utils.h"
 #include "test/providers/provider_test_utils.h"
 #include "test/util/include/default_providers.h"
+#include "test/util/include/scoped_env_vars.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime_api.h>
@@ -1868,6 +1869,67 @@ TEST(ContribOpLinearAttentionTest, BFloat16_Cuda) {
   tester.AddInput<BFloat16>("beta", beta_dims, ToBFloat16(beta_3d));
   tester.AddOutput<BFloat16>("output", out_dims, ToBFloat16(output_3d), false, 0.02f, 0.0f);
   tester.AddOutput<BFloat16>("present_state", state_dims, ToBFloat16(expected_state), false, 0.02f, 0.0f);
+
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(std::move(ep));
+  tester.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
+
+// With ORT_LINEAR_ATTENTION_CHUNKED_PREFILL=1, a float prefill of at least 32 tokens with d_k = d_v = 128
+// runs on the GatedDeltaNet chunked engine: q/k/v/output round through float16, gates and state stay float.
+// 96 tokens covers a full and a partial 64-token chunk.
+TEST(ContribOpLinearAttentionTest, GatedDeltaRule_ChunkedPrefill_Float_Cuda) {
+  auto ep = DefaultCudaExecutionProvider();
+  if (!ep) {
+    GTEST_SKIP() << "CUDA execution provider not available";
+    return;
+  }
+  ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_LINEAR_ATTENTION_CHUNKED_PREFILL", "1"}}};
+
+  constexpr int B = 2, H = 2, T = 96, dk = 128, dv = 128;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(dk));
+
+  std::vector<float> query(B * H * T * dk);
+  std::vector<float> key(B * H * T * dk);
+  std::vector<float> value(B * H * T * dv);
+  std::vector<float> decay(B * H * T);
+  std::vector<float> beta(B * H * T);
+  std::vector<float> initial_state(static_cast<size_t>(B) * H * dk * dv);
+  for (size_t i = 0; i < query.size(); i++) query[i] = 0.5f * std::sin(static_cast<float>(i) * 0.13f);
+  for (size_t i = 0; i < key.size(); i++) key[i] = 0.5f * std::cos(static_cast<float>(i) * 0.17f);
+  // The chunked engine needs L2-normalized keys (as gated delta net models provide); see gated_delta_net_op_test.cc.
+  for (auto* qk : {&query, &key}) {
+    for (size_t row = 0; row < qk->size(); row += dk) {
+      float sum = 0.0f;
+      for (int d = 0; d < dk; d++) sum += (*qk)[row + d] * (*qk)[row + d];
+      for (int d = 0; d < dk; d++) (*qk)[row + d] /= std::sqrt(sum);
+    }
+  }
+  for (size_t i = 0; i < value.size(); i++) value[i] = 0.5f * std::sin(static_cast<float>(i) * 0.23f + 0.5f);
+  for (size_t i = 0; i < decay.size(); i++) {
+    decay[i] = -0.1f - 0.05f * std::abs(std::sin(static_cast<float>(i) * 0.3f));
+    beta[i] = 0.5f + 0.3f * std::sin(static_cast<float>(i) * 0.31f);
+  }
+  for (size_t i = 0; i < initial_state.size(); i++) initial_state[i] = 0.1f * std::cos(static_cast<float>(i) * 0.07f);
+
+  std::vector<float> expected_output_4d, expected_state;
+  LinearAttentionReference("gated_delta", B, H, T, dk, dv, scale, query, key, value, &initial_state, &decay, &beta,
+                           expected_output_4d, expected_state);
+
+  OpTester tester("LinearAttention", 1, onnxruntime::kMSDomain);
+  tester.AddAttribute<std::string>("update_rule", "gated_delta");
+  tester.AddAttribute<float>("scale", scale);
+  tester.AddAttribute<int64_t>("q_num_heads", static_cast<int64_t>(H));
+  tester.AddAttribute<int64_t>("kv_num_heads", static_cast<int64_t>(H));
+  tester.AddInput<float>("query", {B, T, H * dk}, PackBHTD_to_BTHD(query, B, H, T, dk));
+  tester.AddInput<float>("key", {B, T, H * dk}, PackBHTD_to_BTHD(key, B, H, T, dk));
+  tester.AddInput<float>("value", {B, T, H * dv}, PackBHTD_to_BTHD(value, B, H, T, dv));
+  tester.AddInput<float>("past_state", {B, H, dk, dv}, initial_state);
+  tester.AddInput<float>("decay", {B, T, H}, TransposeBHT_to_BTH(decay, B, H, T));
+  tester.AddInput<float>("beta", {B, T, H}, TransposeBHT_to_BTH(beta, B, H, T));
+  tester.AddOutput<float>("output", {B, T, H * dv}, PackBHTD_to_BTHD(expected_output_4d, B, H, T, dv),
+                          false, 0.01f, 0.01f);
+  tester.AddOutput<float>("present_state", {B, H, dk, dv}, expected_state, false, 0.01f, 0.01f);
 
   std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
   execution_providers.push_back(std::move(ep));
