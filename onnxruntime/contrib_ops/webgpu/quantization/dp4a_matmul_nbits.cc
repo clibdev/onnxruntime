@@ -35,7 +35,7 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
     shader.AddInput("weight_index_indirect", ShaderUsage::UseUniform);
   }
   if (has_qlora_up_) {
-    const auto& lora_t = shader.AddInput("lora_t");
+    const auto& lora_t = shader.AddInput("lora_t", ShaderUsage::None);
     const auto& lora_b = shader.AddInput("lora_b");
     const auto& lora_b_scales = shader.AddInput("lora_b_scales");
     ORT_RETURN_IF_ERROR(GenerateQLoRAUp(shader, lora_t, lora_b, lora_b_scales, acc_f32_, true));
@@ -262,7 +262,7 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
     mul_program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
   }
   if (has_qlora_up) {
-    mul_program.AddInput({lora_t, ProgramTensorMetadataDependency::Type, ProgramInput::Flatten, 4});
+    mul_program.AddInput({lora_t, ProgramTensorMetadataDependency::Type, 4});
     mul_program.AddInput({lora_b, ProgramTensorMetadataDependency::Type, 16});
     mul_program.AddInput({lora_b_scales, ProgramTensorMetadataDependency::Type});
   }

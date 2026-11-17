@@ -51,7 +51,7 @@ class QLoRAOutputProgram final : public Program<QLoRAOutputProgram> {
                                           {"M", ProgramUniformVariableDataType::Uint32});
   Status GenerateShaderCode(ShaderHelper& shader) const override {
     const auto& base = shader.AddInput("base");
-    const auto& lora_t = shader.AddInput("lora_t");
+    const auto& lora_t = shader.AddInput("lora_t", ShaderUsage::None);
     const auto& lora_b = shader.AddInput("lora_b");
     const auto& lora_b_scales = shader.AddInput("lora_b_scales");
     const auto& output = shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
@@ -77,7 +77,7 @@ Status ApplyQLoRAOutput(onnxruntime::webgpu::ComputeContext& context, const Tens
   QLoRAOutputProgram program(context.EnableMatmulFp32Accumulation());
   program
       .AddInputs({{base, ProgramTensorMetadataDependency::Type, ProgramInput::Flatten},
-                  {t, ProgramTensorMetadataDependency::Type, ProgramInput::Flatten, 4},
+                  {t, ProgramTensorMetadataDependency::Type, 4},
                   {b, ProgramTensorMetadataDependency::Type, 16},
                   {scales, ProgramTensorMetadataDependency::Type}})
       .AddOutput({y, ProgramTensorMetadataDependency::Type, ProgramOutput::Flatten})

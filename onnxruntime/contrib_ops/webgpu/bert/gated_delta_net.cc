@@ -280,16 +280,16 @@ Status GatedDeltaNetParamsProgram::GenerateShaderCode(ShaderHelper& shader) cons
 }
 
 Status GatedDeltaNetCopyProgram::GenerateShaderCode(ShaderHelper& shader) const {
-  const auto& src = shader.AddInput("src");
-  const auto& dst = shader.AddOutput("dst");
+  const auto& src = shader.AddInput("src", ShaderUsage::None);
+  const auto& dst = shader.AddOutput("dst", ShaderUsage::None);
   shader.MainFunctionBody() << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.element_count")
                             << "  " << dst.SetByOffset("global_idx", src.GetByOffset("global_idx")) << "\n";
   return Status::OK();
 }
 
 Status GatedDeltaNetUnpackQkvProgram::GenerateShaderCode(ShaderHelper& shader) const {
-  const auto& packed_qkv = shader.AddInput("packed_qkv");
-  const auto& unpacked_qkv = shader.AddOutput("unpacked_qkv");
+  const auto& packed_qkv = shader.AddInput("packed_qkv", ShaderUsage::None);
+  const auto& unpacked_qkv = shader.AddOutput("unpacked_qkv", ShaderUsage::None);
   shader.MainFunctionBody()
       << shader.GuardAgainstOutOfBoundsWorkgroupSizes(
              "uniforms.total_tokens * (2u * uniforms.query_size + uniforms.value_size)")
@@ -587,8 +587,7 @@ Status GatedDeltaNet::ComputeInternal(onnxruntime::webgpu::ComputeContext& conte
     if (input_is_packed_qkv) {
       GatedDeltaNetUnpackQkvProgram unpack_program;
       unpack_program
-          // Query is rank 2 or 3; flatten so the generated shader is rank-independent.
-          .AddInput({query, ProgramTensorMetadataDependency::Type, ProgramInput::Flatten})
+          .AddInput({query, ProgramTensorMetadataDependency::Type})
           .AddOutput({&*packed_qkv, ProgramTensorMetadataDependency::Type})
           .SetDispatchGroupSize((onnxruntime::narrow<uint32_t>(qkv_element_count) + WORKGROUP_SIZE - 1) /
                                 WORKGROUP_SIZE)
@@ -602,10 +601,10 @@ Status GatedDeltaNet::ComputeInternal(onnxruntime::webgpu::ComputeContext& conte
       const auto copy_to_packed_qkv = [&](const Tensor* source) -> Status {
         GatedDeltaNetCopyProgram copy_program;
         copy_program
-            .AddInput({source, ProgramTensorMetadataDependency::Type, ProgramInput::Flatten})
+            .AddInput({source, ProgramTensorMetadataDependency::Type})
             .AddOutput(ProgramOutput::BufferView(&*packed_qkv,
                                                  ProgramTensorMetadataDependency::Type,
-                                                 TensorShape{source->Shape().Size()},
+                                                 source->Shape(),
                                                  packed_offset))
             .SetDispatchGroupSize((onnxruntime::narrow<uint32_t>(source->Shape().Size()) + WORKGROUP_SIZE - 1) /
                                   WORKGROUP_SIZE)
