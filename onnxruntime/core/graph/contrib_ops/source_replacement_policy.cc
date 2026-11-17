@@ -37,6 +37,12 @@ bool Contains(gsl::span<const OpKey> keys, const OpKey& key) {
   return std::find(keys.begin(), keys.end(), key) != keys.end();
 }
 
+// Mirrors ONNX OpSchemaRegisterImpl, which registers an unset since-version as 1.
+int RegisteredSinceVersion(const ONNX_NAMESPACE::OpSchema& schema) {
+  const int version = schema.SinceVersion();
+  return version == ONNX_NAMESPACE::OpSchema::kUninitializedSinceVersion ? 1 : version;
+}
+
 void RecordRegisteredSchema(const std::string& name, const std::string& domain, int since_version) {
   const auto* registered = ONNX_NAMESPACE::OpSchemaRegistry::Schema(name, since_version, domain);
   if (registered && registered->SinceVersion() == since_version) RecordContribSchema(*registered);
@@ -62,12 +68,8 @@ Status RecordSourcePolicy(const ONNX_NAMESPACE::OpSchema& schema, SourcePolicy p
   return RecordSourcePolicy(metadata.policies, schema, std::move(policy));
 }
 
-void RecordPendingSourcePolicy(ONNX_NAMESPACE::OpSchema& schema, const char* name, int since_version,
-                               std::string_view reason) {
-  schema.SetName(name).SetDomain(kMSDomain).SinceVersion(since_version);
-  schema.Finalize();
-  ORT_THROW_IF_ERROR(RecordSourcePolicy(
-      schema, {NonExecutableState::PendingTodo, std::string(reason), std::nullopt}));
+void AuthorSourcePolicy(const ONNX_NAMESPACE::OpSchema& schema, SourcePolicy policy) {
+  ORT_THROW_IF_ERROR(RecordSourcePolicy(schema, std::move(policy)));
 }
 
 Status RecordSourcePolicy(InlinedVector<SourcePolicyRecord>& records,
@@ -109,20 +111,18 @@ std::function<void(ONNX_NAMESPACE::OpSchema&&)> CollectContribSchemas(
   return [register_schema = std::move(register_schema)](ONNX_NAMESPACE::OpSchema&& schema) {
     const auto name = schema.Name();
     const auto domain = schema.domain();
+    const int since_version = RegisteredSinceVersion(schema);
     register_schema(std::move(schema));
-    // ONNX finalizes/normalizes SinceVersion before moving: the scalar survives,
-    // unlike Name/domain, which must be captured before registration.
-    RecordRegisteredSchema(name, domain, schema.SinceVersion());
+    RecordRegisteredSchema(name, domain, since_version);
   };
 }
 
 ContribSchemaRegisterOnce::ContribSchemaRegisterOnce(ONNX_NAMESPACE::OpSchema schema) {
   const auto name = schema.Name();
   const auto domain = schema.domain();
-  // ONNX normalizes the version through its rvalue-reference registration before moving
-  // the schema. The scalar since-version survives that move; names must be captured first.
+  const int since_version = RegisteredSinceVersion(schema);
   ONNX_NAMESPACE::OpSchemaRegistry::OpSchemaRegisterOnce::OpSchemaRegisterNoExcept(std::move(schema));
-  RecordRegisteredSchema(name, domain, schema.SinceVersion());
+  RecordRegisteredSchema(name, domain, since_version);
 }
 
 SourceStatus ResolveSourceStatus(const OpKey& key, std::string_view ep, std::string_view variant,

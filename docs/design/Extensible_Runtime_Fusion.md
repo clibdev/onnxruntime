@@ -92,7 +92,7 @@ contrib schema key (domain, name, **exact since-version**) must have either:
 - An explicitly authored PendingTodo or Special state, with a nonempty
   explanation and an optional issue.
 
-Schema authors call `RecordSourcePolicy(actual_schema, policy)` during the
+Schema authors call `AuthorSourcePolicy(actual_schema, policy)` during the
 schema registration workflow (`RegisterContribSchemas` or the op's schema
 factory). Supply a complete, exact since-version. Identical duplicates are idempotent; conflicting
 declarations are errors. Registration collects actual schema keys rather than
@@ -101,15 +101,26 @@ untouched existing keys without per-old-schema TODO edits; a new since-version
 cannot inherit the exemption. Do not automatically regenerate or casually
 expand that baseline when adding schemas. Malformed executable declarations
 remain errors even for legacy keys. Pending future variants can coexist with a
-qualified Available variant.
+qualified Available variant; a Special operator cannot have any executable
+declaration.
+
+Each EP owns its executable declarations. Rule IDs are unique within an EP, so
+different EPs may reuse an ID, and one (target, EP, variant) key resolves to at
+most one declaration. A declaration's target opset requirement must equal the
+target schema's exact since-version (`ai.onnx` and `""` are the same domain).
+This suits `com.microsoft` targets, whose import version is the schema version.
+It is a known v0 limitation for ONNX-domain targets such as legacy
+backward-compatibility contrib schemas, whose model import versions normally
+exceed the since-version; no such target has an executable declaration yet.
 
 #### Worked schema-author path
 
 This compilable example uses the existing ELSEWHERE schema-builder macro.
 Explicit `SinceVersion(1)` and `Finalize()` establish the complete schema before
-the policy helper copies its exact key. The helper's Status is propagated by
-`ORT_THROW_IF_ERROR`, as required by this void registration workflow; do not
-discard it. The schema registration wrapper also observes ONNX's finalized
+the policy helper copies its exact key. `AuthorSourcePolicy` throws on an
+invalid or conflicting policy, as required by this void registration workflow.
+It is a no-op in schema-only (`ort_opschema_lib`) and contrib-disabled builds,
+which compile schema builders without the policy inventory. The schema registration wrapper also observes ONNX's finalized
 version after registration (including ONNX's default-version normalization).
 
 ```cpp
@@ -126,9 +137,8 @@ ONNX_NAMESPACE::OpSchema DefineSourcePolicyExample(ONNX_NAMESPACE::OpSchema sche
       .Output(0, "Y", "Output tensor.", "T")
       .TypeConstraint("T", {"tensor(float)"}, "Float tensors.");
   schema.Finalize();
-  ORT_THROW_IF_ERROR(RecordSourcePolicy(
-      schema, {NonExecutableState::PendingTodo,
-               "No EP source replacement has been numerically qualified.", std::nullopt}));
+  AuthorSourcePolicy(schema, {NonExecutableState::PendingTodo,
+                              "No EP source replacement has been numerically qualified.", std::nullopt});
   return schema;
 }
 
