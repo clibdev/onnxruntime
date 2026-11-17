@@ -529,12 +529,12 @@ def compute_data_quant_params(
     if rmin_override is not None:
         rmin = rmin_override
     else:
-        rmin = data.min() if len(data) else 0.0
+        rmin = data.min() if data.size else 0.0
 
     if rmax_override is not None:
         rmax = rmax_override
     else:
-        rmax = data.max() if len(data) else 0.0
+        rmax = data.max() if data.size else 0.0
 
     rmin = numpy.array(rmin, dtype=data.dtype)
     rmax = numpy.array(rmax, dtype=data.dtype)
@@ -543,8 +543,11 @@ def compute_data_quant_params(
     if quant_type == TensorProto.FLOAT8E4M3FN:
         if reduce_range:
             raise RuntimeError("Unsupported option reduce_range=True for float 8.")
-        std = numpy.std(data)
+        stats_dtype = numpy.float64 if data.dtype in (numpy.float16, numpy.float32) else None
+        std = numpy.std(data, dtype=stats_dtype)
         zero_point, scale = compute_scale_zp_float8(quant_type, std)
+        if stats_dtype is not None:
+            scale = scale.astype(data.dtype)
         return _check_type(zero_point, scale, zero_point_index=0)
 
     if quant_type in (
@@ -556,7 +559,7 @@ def compute_data_quant_params(
         TensorProto.UINT4,
     ):
         qmin, qmax = get_qmin_qmax_for_qType(quant_type, reduce_range, symmetric=symmetric)
-        if len(data):
+        if data.size:
             zero_point, scale = compute_scale_zp(rmin, rmax, qmin, qmax, symmetric, min_real_range)
         else:
             zero_point = numpy.array(0, dtype=qmin.dtype)
@@ -1201,7 +1204,7 @@ def update_opset_version(
         )
         target_opset_version = 21
 
-    elif opset_version < 19 and weight_quant_type == onnx.TensorProto.FLOAT8E4M3FN:
+    elif opset_version < 19 and weight_quant_type == onnx.TensorProto.FLOAT8E4M3FN and not needs_opset21_for_16bit:
         logging.warning(
             f"The original model opset version is {opset_version}, which does not support quantization to float 8. "
             "Please update the model to opset >= 19. Automatically update the model to opset 19. "
