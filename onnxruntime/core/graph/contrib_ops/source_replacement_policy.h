@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 #pragma once
 
-#if !defined(ORT_MINIMAL_BUILD) && (!defined(DISABLE_CONTRIB_OPS) || defined(_OPSCHEMA_LIB_))
+#if !defined(ORT_MINIMAL_BUILD)
 
 #include <functional>
 #include <optional>
@@ -11,23 +11,11 @@
 
 #include "core/common/inlined_containers.h"
 #include "core/common/common.h"
+#include "core/graph/constants.h"
 #include "core/graph/onnx_protobuf.h"
 #include "gsl/gsl"
 
-#if defined(_OPSCHEMA_LIB_)
-#include "core/graph/constants.h"
-#endif
-
 namespace onnxruntime::contrib {
-
-struct OpKey {
-  std::string domain;
-  std::string name;
-  int since_version;
-  bool operator==(const OpKey&) const = default;
-};
-
-OpKey SourceOpKey(const ONNX_NAMESPACE::OpSchema& schema);
 
 enum class NonExecutableState { PendingTodo,
                                 Special };
@@ -39,6 +27,37 @@ struct SourcePolicy {
   bool operator==(const SourcePolicy&) const = default;
 };
 
+#if !defined(DISABLE_CONTRIB_OPS) && !defined(_OPSCHEMA_LIB_)
+// Schema-author entry point: call on the finalized schema inside its builder. Throws on an
+// invalid or conflicting policy.
+void AuthorSourcePolicy(const ONNX_NAMESPACE::OpSchema& schema, SourcePolicy policy);
+#else
+// Schema-only and contrib-disabled builds compile schema builders without the policy inventory.
+inline void AuthorSourcePolicy(const ONNX_NAMESPACE::OpSchema&, const SourcePolicy&) {}
+#endif
+
+// Schema builders run before the enclosing macro supplies the finalized schema key.
+inline void RecordPendingSourcePolicy(ONNX_NAMESPACE::OpSchema& schema, const char* name, int since_version,
+                                      std::string_view reason) {
+  schema.SetName(name).SetDomain(kMSDomain).SinceVersion(since_version);
+  schema.Finalize();
+  AuthorSourcePolicy(schema, {NonExecutableState::PendingTodo, std::string(reason), std::nullopt});
+}
+
+}  // namespace onnxruntime::contrib
+
+#if !defined(DISABLE_CONTRIB_OPS) && !defined(_OPSCHEMA_LIB_)
+namespace onnxruntime::contrib {
+
+struct OpKey {
+  std::string domain;
+  std::string name;
+  int since_version;
+  bool operator==(const OpKey&) const = default;
+};
+
+OpKey SourceOpKey(const ONNX_NAMESPACE::OpSchema& schema);
+
 struct SourcePolicyRecord {
   OpKey key;
   SourcePolicy policy;
@@ -49,17 +68,6 @@ Status ValidateSourcePolicy(const SourcePolicy& policy);
 // Copies authored metadata. Identical duplicates are idempotent; conflicts are errors.
 // Call during schema registration, not through a static/linker registration mechanism.
 Status RecordSourcePolicy(const ONNX_NAMESPACE::OpSchema& schema, SourcePolicy policy);
-#if defined(_OPSCHEMA_LIB_)
-static inline void RecordPendingSourcePolicy(ONNX_NAMESPACE::OpSchema& schema, const char* name, int since_version,
-                                             std::string_view) {
-  schema.SetName(name).SetDomain(kMSDomain).SinceVersion(since_version);
-  schema.Finalize();
-}
-#else
-// Schema builders run before the enclosing macro supplies the finalized schema key.
-void RecordPendingSourcePolicy(ONNX_NAMESPACE::OpSchema& schema, const char* name, int since_version,
-                               std::string_view reason);
-#endif
 // The same recorder over an explicitly owned collection; no process-global test state.
 Status RecordSourcePolicy(InlinedVector<SourcePolicyRecord>& records,
                           const ONNX_NAMESPACE::OpSchema& schema, SourcePolicy policy);
@@ -107,4 +115,5 @@ SourceStatus ResolveSourceStatus(const OpKey& key, std::string_view ep, std::str
                                  gsl::span<const OpKey> legacy);
 
 }  // namespace onnxruntime::contrib
-#endif
+#endif  // !defined(DISABLE_CONTRIB_OPS) && !defined(_OPSCHEMA_LIB_)
+#endif  // !defined(ORT_MINIMAL_BUILD)

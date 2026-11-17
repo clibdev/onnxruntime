@@ -2700,6 +2700,8 @@ Status PatternRewriter::ValidateRule(const Rule& rule) {
 }
 
 Status PatternRewriter::ValidateRuleImpl(const Rule& rule, bool validate_output_count) {
+  ORT_RETURN_IF_NOT(!rule.name.empty() && !rule.pattern.Nodes().empty() && rule.replacement,
+                    "Rules need a name, at least one node and a recipe.");
   ORT_RETURN_IF_ERROR(ValidateOpsets(rule));
   const auto* recipe = rule.replacement.Parsed();
   if (!recipe || !recipe->Plan()) return Status::OK();

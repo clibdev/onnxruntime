@@ -354,6 +354,50 @@ TEST(ContribSourceReplacementPolicyTest, AcceptsOnnxOpsetAlias) {
   EXPECT_NO_THROW(rewrite::PatternRewriter({source.body.rule}));
 }
 
+TEST(ContribSourceReplacementPolicyTest, OnnxDomainTargetAcceptsOpsetAndReplacementAlias) {
+  auto source = ScaledSiLUSources().front();
+  source.target = {kOnnxDomain, "Identity", 1};
+  source.body.rule.opsets = {{kOnnxDomainAlias, 1, 1}};
+  source.body.rule.replacement = rewrite::Replacement("(x)=>ai.onnx.Identity(x)");
+  const std::array schemas{source.target};
+  const std::array metadata{source.Metadata()};
+  ASSERT_STATUS_OK(ValidateSourceDeclarations(schemas, {}, metadata, {}));
+}
+
+TEST(ContribSourceReplacementPolicyTest, ExecutableSourceIdentityIsEPScoped) {
+  const auto original = ScaledSiLUSources().front();
+  const std::array schemas{original.target};
+  auto other_ep = original.Metadata();
+  other_ep.ep = kCpuExecutionProvider;
+  const std::array cross_ep{original.Metadata(), other_ep};
+  ASSERT_STATUS_OK(ValidateSourceDeclarations(schemas, {}, cross_ep, {}));
+
+  auto renamed = original;
+  renamed.body.rule.name = "different-body";
+  const std::array same_key{original.Metadata(), renamed.Metadata()};
+  EXPECT_FALSE(ValidateSourceDeclarations(schemas, {}, same_key, {}).IsOK());
+
+  auto other_variant = original;
+  other_variant.rule_id = "other-variant";
+  const std::array same_rule{original.Metadata(), other_variant.Metadata()};
+  EXPECT_FALSE(ValidateSourceDeclarations(schemas, {}, same_rule, {}).IsOK());
+
+  const std::array single{original.Metadata()};
+  const std::array special{SourcePolicyRecord{original.target, {NonExecutableState::Special, "No semantics", {}}}};
+  EXPECT_FALSE(ValidateSourceDeclarations(schemas, special, single, {}).IsOK());
+}
+
+TEST(ContribSourceReplacementPolicyTest, ValidateRuleRejectsIncompleteRules) {
+  const auto original = ScaledSiLUSources().front().body.rule;
+  ASSERT_STATUS_OK(rewrite::PatternRewriter::ValidateRule(original));
+  auto rule = original;
+  rule.name.clear();
+  EXPECT_FALSE(rewrite::PatternRewriter::ValidateRule(rule).IsOK());
+  rule = original;
+  rule.replacement = nullptr;
+  EXPECT_FALSE(rewrite::PatternRewriter::ValidateRule(rule).IsOK());
+}
+
 TEST(ContribSourceReplacementPolicyTest, RejectsInvalidReplacementBindingsBeforeDiscovery) {
   for (const auto* replacement : {
            "(missing)=>com.microsoft.ScaledSiLU(missing)",

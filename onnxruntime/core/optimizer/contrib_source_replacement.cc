@@ -21,6 +21,10 @@ bool Contains(gsl::span<const OpKey> keys, const OpKey& key) {
   return std::find(keys.begin(), keys.end(), key) != keys.end();
 }
 
+std::string_view CanonicalDomain(std::string_view domain) {
+  return domain == kOnnxDomainAlias ? std::string_view(kOnnxDomain) : domain;
+}
+
 Status ValidateBody(const ExecutableSource& source) {
   ORT_RETURN_IF_NOT(ValidKey(source.target) && HasText(source.ep) && HasText(source.variant) && source.body,
                     "Malformed executable source declaration.");
@@ -43,7 +47,8 @@ Status ValidateBody(const ExecutableSource& source) {
   ORT_RETURN_IF_ERROR(rewrite::PatternRewriter::ValidateRule(rule));
   bool target_opset = false;
   for (const auto& opset : rule.opsets) {
-    if (opset.domain == source.target.domain && opset.min_version == source.target.since_version &&
+    if (CanonicalDomain(opset.domain) == CanonicalDomain(source.target.domain) &&
+        opset.min_version == source.target.since_version &&
         opset.max_version == source.target.since_version) target_opset = true;
   }
   ORT_RETURN_IF_NOT(target_opset, "Executable source must specify the exact target opset.");
@@ -51,7 +56,7 @@ Status ValidateBody(const ExecutableSource& source) {
     ORT_RETURN_IF_NOT(recipe->Plan() && !recipe->Plan()->empty() && !recipe->Outputs().empty(),
                       "Executable source has an empty replacement DAG.");
     const bool has_target = std::any_of(recipe->Plan()->begin(), recipe->Plan()->end(), [&](const auto& node) {
-      return node.op == source.target.name && node.domain == source.target.domain;
+      return node.op == source.target.name && CanonicalDomain(node.domain) == CanonicalDomain(source.target.domain);
     });
     ORT_RETURN_IF_NOT(has_target, "Executable source replacement does not contain its declared target.");
   }
@@ -84,9 +89,21 @@ Status ValidateSourceDeclarations(gsl::span<const OpKey> schemas,
     const auto& source = sources[i];
     ORT_RETURN_IF_ERROR(ValidateBody(source));
     ORT_RETURN_IF_NOT(Contains(schemas, source.target), "Orphan executable source for ", source.target.name, ".");
+    ORT_RETURN_IF(std::any_of(policies.begin(), policies.end(),
+                              [&](const auto& record) {
+                                return record.key == source.target &&
+                                       record.policy.state == NonExecutableState::Special;
+                              }),
+                  "Executable source targets Special operator ", source.target.name, ".");
+    // Each EP owns its sources: rule ids are EP-scoped, and a lookup key resolves to one body.
     for (size_t j = 0; j < i; ++j) {
-      ORT_RETURN_IF(sources[j].body->rule.name == source.body->rule.name,
-                    "Duplicate executable source rule id: ", source.body->rule.name, ".");
+      const auto& prior = sources[j];
+      if (prior.ep != source.ep) continue;
+      ORT_RETURN_IF(prior.body->rule.name == source.body->rule.name,
+                    "Duplicate executable source rule id for ", source.ep, ": ", source.body->rule.name, ".");
+      ORT_RETURN_IF(prior.target == source.target && prior.variant == source.variant,
+                    "Duplicate executable source for ", source.target.name, " on ", source.ep,
+                    " variant ", source.variant, ".");
     }
   }
   for (const auto& key : schemas) {
